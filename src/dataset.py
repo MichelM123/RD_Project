@@ -26,6 +26,8 @@ class EpicKitchensDataset(Dataset):
         csv_path: Optional[str] = None,
         num_frames: int = 16,
         transform: Optional[Callable] = None,
+        spatial_size: int = 112,  # target H=W (for 3D ResNet)
+
     ):
         """
         Args:
@@ -49,6 +51,7 @@ class EpicKitchensDataset(Dataset):
         self.df = pd.read_csv(self.csv_path)
         self.num_frames = num_frames
         self.transform = transform
+        self.spatial_size = spatial_size
 
         # Filter to rows for which the video file actually exists (handles missing clips)
         keep_indices: List[int] = []
@@ -136,8 +139,14 @@ class EpicKitchensDataset(Dataset):
                     frame = np.zeros((360, 640, 3), dtype=np.uint8)
 
             # NEW: resize to 224x224 to reduce memory and match common ResNet input size
-            frame = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_AREA)
-
+            # frame = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_AREA)
+            
+            # resize to spatial_size x spatial_size
+            frame = cv2.resize(
+                frame,
+                (self.spatial_size, self.spatial_size),
+                interpolation=cv2.INTER_AREA,
+            )
             frames.append(frame)
 
         cap.release()

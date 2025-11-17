@@ -3,9 +3,7 @@ import os
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split, Subset
-
-import pandas as pd
+from torch.utils.data import DataLoader, random_split
 from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
@@ -14,10 +12,13 @@ from sklearn.metrics import (
 
 from dataset import EpicKitchensDataset
 from model import Epic2DResNet
+from model_3d import Epic3DResNet
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train EPIC-KITCHENS 2D ResNet model")
+    parser = argparse.ArgumentParser(
+        description="Train EPIC-KITCHENS model (2D TSN or 3D ResNet-18)"
+    )
 
     parser.add_argument(
         "--root",
@@ -25,33 +26,64 @@ def parse_args():
         default="/data/leuven/380/vsc38046/RD_Project/epic-kitchens-data",
         help="Dataset root (contains annotations/, videos_640x360/).",
     )
+
+    # Single CSV (train) we'll split it into train/val 
     parser.add_argument(
-        "--csv_path",
+        "--train_csv",
         type=str,
         default=None,
-        help="Path to EPIC_100_train.csv (if None, uses default under root/annotations/).",
+        help="Path to EPIC_100_train.csv "
+             "(if None, uses root/annotations/EPIC_100_train.csv).",
     )
+
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["2d", "3d"],
+        default="2d",
+        help="Model type: '2d' (ResNet-50 TSN) or '3d' (r3d_18).",
+    )
+
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--num_frames", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--val_split", type=float, default=0.1)
-    parser.add_argument("--save_dir", type=str, default="./checkpoints_epic")
+    parser.add_argument(
+        "--val_split",
+        type=float,
+        default=0.1,
+        help="Fraction of data (from train CSV) used for validation.",
+    )
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="./checkpoints_epic",
+        help="Directory to store checkpoints.",
+    )
 
-    # NEW: debug subset
     parser.add_argument(
         "--max_samples",
         type=int,
         default=None,
-        help="If set, use only the first N samples from the dataset (for debugging).",
+        help="If set, use only the first N samples (after filtering) "
+             "from the full dataset (for debugging).",
+    )
+
+    parser.add_argument(
+        "--spatial_size",
+        type=int,
+        default=112,
+        help="Resize frames to spatial_size x spatial_size "
+             "(e.g., 112 for 3D ResNet, 224 for 2D TSN).",
     )
 
     return parser.parse_args()
 
 
 def evaluate(model, loader, device):
+    """Run evaluation on a loader and compute metrics."""
     model.eval()
 
     all_v_true, all_v_pred, all_v_prob = [], [], []
@@ -59,7 +91,7 @@ def evaluate(model, loader, device):
 
     with torch.no_grad():
         for clips, verb, noun, meta in loader:
-            clips = clips.to(device)      # [B, C, T, H, W]
+            clips = clips.to(device)
             verb = verb.to(device)
             noun = noun.to(device)
 
@@ -137,32 +169,44 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # ---- Dataset ----
-    ds = EpicKitchensDataset(
+    #  Resolve train CSV path 
+    if args.train_csv is None:
+        args.train_csv = os.path.join(
+            args.root, "annotations", "EPIC_100_train.csv"
+        )
+
+    print(f"Using TRAIN CSV (for full dataset & split): {args.train_csv}")
+
+    #  Build full dataset from TRAIN CSV 
+    full_ds = EpicKitchensDataset(
         root=args.root,
-        csv_path=args.csv_path,
+        csv_path=args.train_csv,
         num_frames=args.num_frames,
-        transform=None,  # you already return [0,1] floats
+        transform=None,
+        spatial_size=args.spatial_size,
     )
 
-    # Label counts from FULL train CSV (before subsampling!)
-    df = ds.df  # already filtered to existing videos
-    num_verbs = int(df["verb_class"].max()) + 1
-    num_nouns = int(df["noun_class"].max()) + 1
+    # restrict to first N samples for debugging
+    if args.max_samples is not None and args.max_samples < len(full_ds):
+        from torch.utils.data import Subset
 
-    # Optional: limit dataset size for debugging
-    if args.max_samples is not None and args.max_samples < len(ds):
-        ds = Subset(ds, list(range(args.max_samples)))
-        print(f"Using only first {args.max_samples} samples for training/validation.")
+        full_ds = Subset(full_ds, list(range(args.max_samples)))
+        print(f"Using only first {args.max_samples} samples from full dataset.")
 
-    print(f"Dataset segments: {len(ds)}")
+    # Access underlying df for label counts (handles Subset or plain dataset)
+    df_source = full_ds.dataset.df if hasattr(full_ds, "dataset") else full_ds.df
+    num_verbs = int(df_source["verb_class"].max()) + 1
+    num_nouns = int(df_source["noun_class"].max()) + 1
+
+    #  Random train/val split 
+    val_len = int(len(full_ds) * args.val_split)
+    train_len = len(full_ds) - val_len
+    train_ds, val_ds = random_split(full_ds, [train_len, val_len])
+
+    print(f"Train segments: {train_len}")
+    print(f"Val segments:   {val_len}")
     print(f"Num verbs: {num_verbs}, Num nouns: {num_nouns}")
-
-    # Train/val split
-    val_len = int(len(ds) * args.val_split)
-    train_len = len(ds) - val_len
-    train_ds, val_ds = random_split(ds, [train_len, val_len])
-
+    
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -178,10 +222,17 @@ def main():
         pin_memory=True,
     )
 
-    # ---- Model, loss, optimizer ----
-    model = Epic2DResNet(num_verbs=num_verbs, num_nouns=num_nouns, pretrained=True)
+    #  Model 
+    if args.model_type == "2d":
+        print("Using 2D ResNet-50 TSN model.")
+        model = Epic2DResNet(num_verbs=num_verbs, num_nouns=num_nouns, pretrained=True)
+    else:
+        print("Using 3D ResNet-18 video model.")
+        model = Epic3DResNet(num_verbs=num_verbs, num_nouns=num_nouns, pretrained=True)
+
     model.to(device)
 
+    #  Loss & Optimizer 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -189,12 +240,13 @@ def main():
 
     best_val_f1 = 0.0
 
+    #  Training loop 
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
 
         for batch_idx, (clips, verb, noun, meta) in enumerate(train_loader):
-            clips = clips.to(device)      # [B, C, T, H, W]
+            clips = clips.to(device)
             verb = verb.to(device)
             noun = noun.to(device)
 
@@ -219,14 +271,13 @@ def main():
 
         train_loss = running_loss / train_len
 
-        # ---- Evaluation ----
+        #  Evaluation on val split 
         metrics = evaluate(model, val_loader, device)
         v = metrics["verb"]
         n = metrics["noun"]
 
         print(f"\nEpoch {epoch}/{args.epochs}")
         print(f"Train loss: {train_loss:.4f}")
-
         print(
             "Verb  - acc: {acc:.3f}, prec: {prec:.3f}, rec: {rec:.3f}, "
             "f1: {f1:.3f}, auc: {auc}".format(
@@ -248,17 +299,20 @@ def main():
             )
         )
 
-        # checkpointing
+        #  Checkpointing 
         val_f1_avg = 0.5 * (v["f1_macro"] + n["f1_macro"])
         if val_f1_avg > best_val_f1:
             best_val_f1 = val_f1_avg
-            ckpt_path = os.path.join(args.save_dir, f"best_epoch_{epoch}.pt")
+            ckpt_path = os.path.join(
+                args.save_dir, f"{args.model_type}_best_epoch_{epoch}.pt"
+            )
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "metrics": metrics,
+                    "args": vars(args),
                 },
                 ckpt_path,
             )
