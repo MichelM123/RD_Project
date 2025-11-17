@@ -116,15 +116,28 @@ class EpicKitchensDataset(Dataset):
 
         frames: List[np.ndarray] = []
 
+        # for fidx in frame_indices:
+        #     cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
+        #     ok, frame = cap.read()
+        #     if not ok or frame is None:
+        #         # If read fails, reuse last frame or use black frame
+        #         if len(frames) > 0:
+        #             frame = frames[-1]
+        #         else:
+        #             frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        #     frames.append(frame)
         for fidx in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
             ok, frame = cap.read()
             if not ok or frame is None:
-                # If read fails, reuse last frame or use black frame
                 if len(frames) > 0:
                     frame = frames[-1]
                 else:
                     frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+            # NEW: resize to 224x224 to reduce memory and match common ResNet input size
+            frame = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_AREA)
+
             frames.append(frame)
 
         cap.release()
