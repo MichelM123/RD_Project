@@ -15,9 +15,17 @@ class Epic3DResNet(nn.Module):
     with two classification heads:
         - verbs  (num_verbs classes)
         - nouns  (num_nouns classes)
+
+    Includes a dropout layer before the heads for regularization.
     """
 
-    def __init__(self, num_verbs: int, num_nouns: int, pretrained: bool = True):
+    def __init__(
+        self,
+        num_verbs: int,
+        num_nouns: int,
+        pretrained: bool = True,
+        dropout: float = 0.5,
+    ):
         super().__init__()
 
         if pretrained:
@@ -31,12 +39,14 @@ class Epic3DResNet(nn.Module):
             else:
                 base = r3d_18(pretrained=False)
 
-        # r3d_18 output: [B, 512] after global pooling
+        # r3d_18 output: [B, 512, 1, 1, 1] after global pooling
         # Strip the final FC layer and keep everything up to global pool
         self.backbone = nn.Sequential(*list(base.children())[:-1])
         self.feat_dim = base.fc.in_features  # 512 for r3d_18
 
-        #  Heads 
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Heads
         self.fc_verb = nn.Linear(self.feat_dim, num_verbs)
         self.fc_noun = nn.Linear(self.feat_dim, num_nouns)
 
@@ -48,8 +58,9 @@ class Epic3DResNet(nn.Module):
             noun_logits: [B, num_nouns]
         """
         # r3d_18 already expects [B, C, T, H, W]
-        feats = self.backbone(x)      # [B, feat_dim, 1, 1, 1]
+        feats = self.backbone(x)  # [B, feat_dim, 1, 1, 1]
         feats = feats.view(feats.size(0), -1)  # [B, feat_dim]
+        feats = self.dropout(feats)
 
         verb_logits = self.fc_verb(feats)
         noun_logits = self.fc_noun(feats)

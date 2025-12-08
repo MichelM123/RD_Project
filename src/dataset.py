@@ -7,6 +7,69 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+import torchvision.transforms as T
+
+# -------------------------------------------------------------------------
+# Video-level transforms for [C, T, H, W] tensors
+# -------------------------------------------------------------------------
+
+# Kinetics-400 normalization stats (as used by torchvision video models)
+KINETICS_MEAN = [0.43216, 0.394666, 0.37645]
+KINETICS_STD = [0.22803, 0.22145, 0.216989]
+
+
+class ClipNormalize(object):
+    """
+    Normalize a clip tensor [C, T, H, W] with given mean/std (per channel).
+    Assumes input is float32 in [0, 1].
+    """
+
+    def __init__(self, mean, std):
+        self.mean = torch.tensor(mean).view(3, 1, 1, 1)
+        self.std = torch.tensor(std).view(3, 1, 1, 1)
+
+    def __call__(self, clip: torch.Tensor) -> torch.Tensor:
+        # clip: [C, T, H, W]
+        return (clip - self.mean) / self.std
+
+
+class RandomHorizontalFlipVideo(object):
+    """
+    Randomly horizontally flip a video clip [C, T, H, W] with probability p.
+    """
+
+    def __init__(self, p: float = 0.5):
+        self.p = p
+
+    def __call__(self, clip: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() < self.p:
+            # Flip along width dimension
+            return torch.flip(clip, dims=[-1])
+        return clip
+
+
+def build_transform(is_train: bool, normalize: bool = True) -> Optional[Callable]:
+    """
+    Build a transform pipeline for video clips [C, T, H, W].
+    - If is_train: apply random horizontal flip + normalization.
+    - If not is_train: apply only normalization (if normalize=True).
+    """
+    transforms: List[Callable] = []
+
+    if is_train:
+        transforms.append(RandomHorizontalFlipVideo(p=0.5))
+
+    if normalize:
+        transforms.append(ClipNormalize(KINETICS_MEAN, KINETICS_STD))
+
+    if len(transforms) == 0:
+        return None
+    return T.Compose(transforms)
+
+
+# -------------------------------------------------------------------------
+# EPIC-KITCHENS Dataset
+# -------------------------------------------------------------------------
 
 
 class EpicKitchensDataset(Dataset):
@@ -14,9 +77,9 @@ class EpicKitchensDataset(Dataset):
     EPIC-KITCHENS-100 dataset (downscaled 640x360 videos).
 
     Returns for each item:
-        clip: FloatTensor [C, T, H, W] in [0, 1]
-        verb_class: LongTensor scalar
-        noun_class: LongTensor scalar
+        clip: FloatTensor [C, T, H, W] (after optional transform)
+        verb_class: LongTensor scalar (or dummy -1 when labels are absent)
+        noun_class: LongTensor scalar (or dummy -1 when labels are absent)
         meta: dict with narration_id, participant_id, video_id
     """
 
@@ -27,7 +90,7 @@ class EpicKitchensDataset(Dataset):
         num_frames: int = 16,
         transform: Optional[Callable] = None,
         spatial_size: int = 112,  # target H=W (for 3D ResNet)
-
+        has_labels: bool = True,
     ):
         """
         Args:
@@ -35,6 +98,7 @@ class EpicKitchensDataset(Dataset):
             csv_path: path to annotation CSV (defaults to EPIC_100_train.csv)
             num_frames: number of frames to sample per clip
             transform: optional transform applied to the clip tensor [C, T, H, W]
+            spatial_size: frames resized to spatial_size x spatial_size
         """
         self.root = Path(root)
         self.video_root = self.root / "videos_640x360"
@@ -52,6 +116,7 @@ class EpicKitchensDataset(Dataset):
         self.num_frames = num_frames
         self.transform = transform
         self.spatial_size = spatial_size
+        self.has_labels = has_labels
 
         # Filter to rows for which the video file actually exists (handles missing clips)
         keep_indices: List[int] = []
@@ -119,29 +184,17 @@ class EpicKitchensDataset(Dataset):
 
         frames: List[np.ndarray] = []
 
-        # for fidx in frame_indices:
-        #     cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
-        #     ok, frame = cap.read()
-        #     if not ok or frame is None:
-        #         # If read fails, reuse last frame or use black frame
-        #         if len(frames) > 0:
-        #             frame = frames[-1]
-        #         else:
-        #             frame = np.zeros((360, 640, 3), dtype=np.uint8)
-        #     frames.append(frame)
         for fidx in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
             ok, frame = cap.read()
             if not ok or frame is None:
+                # If read fails, reuse last frame or use black frame
                 if len(frames) > 0:
                     frame = frames[-1]
                 else:
                     frame = np.zeros((360, 640, 3), dtype=np.uint8)
 
-            # NEW: resize to 224x224 to reduce memory and match common ResNet input size
-            # frame = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_AREA)
-            
-            # resize to spatial_size x spatial_size
+            # Resize to spatial_size x spatial_size
             frame = cv2.resize(
                 frame,
                 (self.spatial_size, self.spatial_size),
@@ -178,8 +231,18 @@ class EpicKitchensDataset(Dataset):
         if self.transform is not None:
             clip = self.transform(clip)
 
-        verb_class = int(row["verb_class"])
-        noun_class = int(row["noun_class"])
+        # -------------------------------
+        # Labels: optional for inference
+        # -------------------------------
+        # Training CSVs (EPIC_100_train.csv) have verb_class/noun_class.
+        # Validation CSV for Codabench (EPIC_100_validation.csv) does NOT.
+        if self.has_labels and "verb_class" in row.index and "noun_class" in row.index:
+            verb_class = int(row["verb_class"])
+            noun_class = int(row["noun_class"])
+        else:
+            # For label-free CSVs, return dummy labels that can be ignored
+            verb_class = -1
+            noun_class = -1
 
         meta: Dict[str, Any] = {
             "narration_id": row["narration_id"],
@@ -188,3 +251,4 @@ class EpicKitchensDataset(Dataset):
         }
 
         return clip, torch.tensor(verb_class), torch.tensor(noun_class), meta
+
