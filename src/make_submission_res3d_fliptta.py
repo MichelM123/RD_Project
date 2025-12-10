@@ -8,22 +8,15 @@ import cv2
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from model_r2plus1d import EpicR2Plus1DResNet
+from model_3d import Epic3DResNet
 
 
-# ------------------------ Validation Dataset ------------------------ #
+# ------------------------ Single-clip validation dataset ------------------------ #
 
-class EpicValDataset(Dataset):
+class EpicValSingleClipDataset(Dataset):
     """
-    Minimal EPIC-KITCHENS-100 validation dataset for Codabench submission.
-
-    - Uses EPIC_100_validation.csv (no verb/noun labels).
-    - For each row:
-        * Locates video in videos_640x360/<participant_id>/<video_id>.MP4 (or .mp4).
-        * Samples num_frames uniformly between start_frame and stop_frame.
-        * Reads frames sequentially, resizes to spatial_size x spatial_size.
-        * Returns normalized clip [C, T, H, W] and meta with narration_id, real_fraction.
-    - If video file is missing/unreadable, returns black clip and real_fraction=0.0.
+    EPIC-KITCHENS-100 validation dataset for single-clip inference
+    (one 16-frame clip per segment, similar to training).
     """
 
     def __init__(
@@ -50,6 +43,7 @@ class EpicValDataset(Dataset):
         for idx, row in self.df.iterrows():
             part = row["participant_id"]
             vid = row["video_id"]
+
             cand1 = self.video_root / part / f"{vid}.MP4"
             cand2 = self.video_root / part / f"{vid}.mp4"
 
@@ -62,32 +56,37 @@ class EpicValDataset(Dataset):
 
             self.samples.append((idx, video_path))
 
-        print(f"[EpicValDataset] Total segments in CSV: {len(self.df)}")
+        print(f"[EpicValSingleClipDataset] Total segments in CSV: {len(self.df)}")
         missing = sum(1 for _, vp in self.samples if vp is None)
         if missing > 0:
-            print(f"[EpicValDataset] WARNING: {missing} segments have no video file; using black clips.")
+            print(f"[EpicValSingleClipDataset] WARNING: {missing} segments have no video; using black clips.")
 
     def __len__(self):
         return len(self.samples)
 
-    def _get_clip_indices(self, start_frame: int, stop_frame: int) -> np.ndarray:
+    def _get_clip_indices_uniform(self, start_frame: int, stop_frame: int) -> np.ndarray:
+        """
+        Uniformly sample num_frames indices between [start_frame, stop_frame].
+        This should match the training sampling strategy.
+        """
         length = stop_frame - start_frame + 1
         if length <= 0:
             return np.full(self.num_frames, start_frame, dtype=int)
-        rel = np.linspace(0, length - 1, num=self.num_frames)
-        rel = np.round(rel).astype(int)
-        rel = np.clip(rel, 0, length - 1)
-        return start_frame + rel
+
+        rel_indices = np.linspace(0, length - 1, num=self.num_frames)
+        rel_indices = np.round(rel_indices).astype(int)
+        rel_indices = np.clip(rel_indices, 0, length - 1)
+        frame_indices = start_frame + rel_indices
+        return frame_indices
 
     def _load_clip_from_video(self, video_path: Path, frame_indices: np.ndarray):
         """
-        Sequential frame reading with cache.
-        Returns:
-            clip: [T, H, W, C] uint8
-            valid_mask: [T] bool (True where frame is real video)
+        Sequential frame reading with caching.
+        Returns clip [T, H, W, C] uint8 and valid_mask [T] bool.
         """
         num_frames = len(frame_indices)
         H = W = self.spatial_size
+
         clip = np.zeros((num_frames, H, W, 3), dtype=np.uint8)
         valid_mask = np.zeros(num_frames, dtype=bool)
 
@@ -99,10 +98,10 @@ class EpicValDataset(Dataset):
             cap.release()
             return clip, valid_mask
 
-        sorted_idx = np.sort(frame_indices)
-        order = np.argsort(frame_indices)
+        sorted_indices = np.sort(frame_indices)
+        first_idx = int(sorted_indices[0])
+        target_max = int(sorted_indices[-1])
 
-        first_idx = int(sorted_idx[0])
         cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
         current_frame_idx = first_idx
 
@@ -114,7 +113,6 @@ class EpicValDataset(Dataset):
         frame_resized = cv2.resize(frame, (W, H), interpolation=cv2.INTER_LINEAR)
         frame_cache = {current_frame_idx: frame_resized}
 
-        target_max = int(sorted_idx[-1])
         while current_frame_idx < target_max:
             success, frame = cap.read()
             if not success or frame is None:
@@ -135,19 +133,17 @@ class EpicValDataset(Dataset):
             elif last_valid is not None:
                 clip[pos] = last_valid
                 valid_mask[pos] = True
-            else:
-                # remains black
-                pass
 
         return clip, valid_mask
 
     def _normalize_clip(self, clip: np.ndarray) -> torch.Tensor:
         """
-        clip: [T, H, W, C] BGR uint8 -> [C, T, H, W] normalized
+        clip: [T, H, W, C] uint8 BGR.
+        Returns [C, T, H, W] float32 normalized with Kinetics stats.
         """
         clip = clip[:, :, :, ::-1]  # BGR -> RGB
         clip = clip.astype("float32") / 255.0
-        clip = np.transpose(clip, (3, 0, 1, 2))  # C, T, H, W
+        clip = np.transpose(clip, (3, 0, 1, 2))  # C,T,H,W
 
         mean = np.array([0.43216, 0.394666, 0.37645], dtype=np.float32)[:, None, None, None]
         std = np.array([0.22803, 0.22145, 0.216989], dtype=np.float32)[:, None, None, None]
@@ -161,14 +157,12 @@ class EpicValDataset(Dataset):
 
         start_frame = int(row["start_frame"])
         stop_frame = int(row["stop_frame"])
-        frame_indices = self._get_clip_indices(start_frame, stop_frame)
 
+        frame_indices = self._get_clip_indices_uniform(start_frame, stop_frame)
         clip_bgr, valid_mask = self._load_clip_from_video(video_path, frame_indices)
-        clip = self._normalize_clip(clip_bgr)
-        real_fraction = float(valid_mask.mean())
+        clip = self._normalize_clip(clip_bgr)  # [C,T,H,W]
 
-        verb_class = -1
-        noun_class = -1
+        real_fraction = float(valid_mask.mean())
 
         meta = {
             "narration_id": row["narration_id"],
@@ -177,14 +171,16 @@ class EpicValDataset(Dataset):
             "real_fraction": real_fraction,
         }
 
-        return clip, torch.tensor(verb_class), torch.tensor(noun_class), meta
+        # dummy labels
+        return clip, torch.tensor(-1), torch.tensor(-1), meta
 
 
-# ------------------------ Submission Script ------------------------ #
+# ------------------------ Submission script ------------------------ #
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate Codabench submission.pt for EPIC-KITCHENS validation set (R(2+1)D-18)."
+        description="Generate Codabench submission.pt for EPIC-KITCHENS validation set "
+                    "(single-clip + horizontal flip TTA, Res3D)."
     )
 
     parser.add_argument(
@@ -198,21 +194,21 @@ def parse_args():
         "--val_csv",
         type=str,
         default=None,
-        help="Path to EPIC_100_validation.csv (if None: <root>/annotations/EPIC_100_validation.csv).",
+        help="Path to EPIC_100_validation.csv (default: <root>/annotations/EPIC_100_validation.csv).",
     )
 
     parser.add_argument(
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to trained R(2+1)D-18 checkpoint.",
+        help="Path to the best model checkpoint (e.g., 3d_best_epoch_v3_10.pt).",
     )
 
     parser.add_argument(
         "--output",
         type=str,
-        default="submission.pt",
-        help="Output filename.",
+        default="submission_fliptta.pt",
+        help="Filename for saved predictions.",
     )
 
     parser.add_argument(
@@ -225,28 +221,28 @@ def parse_args():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=0,
-        help="Number of dataloader workers.",
+        default=4,
+        help="Number of DataLoader workers.",
     )
 
     parser.add_argument(
         "--num_frames",
         type=int,
         default=16,
-        help="Number of frames per clip.",
+        help="Number of frames per clip (must match training).",
     )
 
     parser.add_argument(
         "--spatial_size",
         type=int,
         default=160,
-        help="Spatial size (resize to spatial_size x spatial_size).",
+        help="Resize frames to spatial_size x spatial_size.",
     )
 
     parser.add_argument(
         "--log_interval",
         type=int,
-        default=5,
+        default=40,
         help="How many batches between progress prints.",
     )
 
@@ -267,8 +263,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Dataset & DataLoader
-    val_ds = EpicValDataset(
+    # ---------------- Dataset & loader ---------------- #
+    val_ds = EpicValSingleClipDataset(
         root=args.root,
         csv_path=args.val_csv,
         num_frames=args.num_frames,
@@ -284,11 +280,11 @@ def main():
         pin_memory=True,
     )
 
-    # Model
+    # ---------------- Model & checkpoint ---------------- #
     num_verbs = 97
     num_nouns = 300
 
-    model = EpicR2Plus1DResNet(num_verbs=num_verbs, num_nouns=num_nouns)
+    model = Epic3DResNet(num_verbs=num_verbs, num_nouns=num_nouns)
     model.to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device)
@@ -297,28 +293,38 @@ def main():
     print("Loaded model state_dict from checkpoint.")
     model.eval()
 
-    # Inference + stats
+    # ---------------- Inference with flip TTA ---------------- #
     all_preds = []
 
     total_segments = len(val_ds)
+    sum_real_fraction = 0.0
     count_pure_black = 0
     count_all_real = 0
     count_mixed = 0
-    sum_real_fraction = 0.0
 
     with torch.no_grad():
-        for batch_idx, (clips, _, _, meta) in enumerate(val_loader):
-            clips = clips.to(device, non_blocking=True)
+        for batch_idx, (clip, _, _, meta) in enumerate(val_loader):
+            # clip: [B, C, T, H, W]
+            clip = clip.to(device, non_blocking=True)
 
-            verb_logits, noun_logits = model(clips)
+            # original
+            verb_logits_orig, noun_logits_orig = model(clip)
 
+            # horizontally flipped: flip along width (last spatial dim)
+            clip_flipped = torch.flip(clip, dims=[-1])
+            verb_logits_flip, noun_logits_flip = model(clip_flipped)
+
+            # average logits
+            verb_logits = 0.5 * (verb_logits_orig + verb_logits_flip)
+            noun_logits = 0.5 * (noun_logits_orig + noun_logits_flip)
+
+            B = clip.size(0)
             batch_narration_ids = meta["narration_id"]
             batch_real_fraction = meta["real_fraction"]
 
-            for i in range(clips.size(0)):
+            for i in range(B):
                 rf = float(batch_real_fraction[i])
                 sum_real_fraction += rf
-
                 if rf == 0.0:
                     count_pure_black += 1
                 elif rf == 1.0:
@@ -328,15 +334,14 @@ def main():
 
                 pred = {
                     "narration_id": batch_narration_ids[i],
-                    "verb_output": verb_logits[i].detach().cpu(),
-                    "noun_output": noun_logits[i].detach().cpu(),
+                    "verb_output": verb_logits[i].cpu(),
+                    "noun_output": noun_logits[i].cpu(),
                 }
                 all_preds.append(pred)
 
             if (batch_idx + 1) % args.log_interval == 0:
-                print(f"Processed {(batch_idx + 1) * clips.size(0)} segments...")
+                print(f"Processed {(batch_idx + 1) * B} segments...")
 
-    # Coverage stats
     avg_real_fraction = sum_real_fraction / float(total_segments)
     print("----- Video coverage stats -----")
     print(f"Total segments:           {total_segments}")
@@ -349,12 +354,9 @@ def main():
     assert len(all_preds) == len(val_ds)
 
     sample = all_preds[0]
-    v = sample["verb_output"]
-    n = sample["noun_output"]
     assert isinstance(sample["narration_id"], str)
-    assert isinstance(v, torch.Tensor) and v.ndim == 1 and v.shape[0] == num_verbs
-    assert isinstance(n, torch.Tensor) and n.ndim == 1 and n.shape[0] == num_nouns
-    print("Sanity checks passed (shapes and counts).")
+    assert isinstance(sample["verb_output"], torch.Tensor) and sample["verb_output"].shape[0] == num_verbs
+    assert isinstance(sample["noun_output"], torch.Tensor) and sample["noun_output"].shape[0] == num_nouns
 
     torch.save(all_preds, args.output)
     print(f"Successfully saved predictions to {args.output}")
