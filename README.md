@@ -6,10 +6,13 @@ The task is addressed using a **visual-only** approach based on a **3D ResNet-18
 
 The repository also includes the full **Codabench validation and submission pipeline**
 
+---
+
 ## 1. Project structure
 
 The repository is organized as follows:
 
+```text
 RD_Project/
 ├── data/
 │   ├── annotations/
@@ -47,6 +50,8 @@ RD_Project/
 
 Code, data, and results are clearly separated to support reproducibility and ease of use.
 
+---
+
 ## 2. Environment and dependencies
 
 The code was tested with:
@@ -60,6 +65,8 @@ Example installation:
   pip install torch torchvision numpy pandas opencv-python
 
 On the Vlaams Supercomputer (VSC), the project is intended to be run using the cluster-provided CUDA-enabled PyTorch environment and SLURM job submission.
+
+---
 
 ## 3. Dataset setup (EPIC-KITCHENS-100)
 
@@ -82,6 +89,8 @@ Notes:
 - During training, annotation entries whose video files are missing are automatically filtered out.
 - During validation inference, missing or unreadable videos are handled by generating black clips and logging coverage statistics.
 
+---
+
 ## 4. Training (VSC / SLURM)
 
 ### 4.1 Launch training
@@ -101,6 +110,7 @@ Key training characteristics:
 
 The best checkpoint is selected using a composite internal validation score (mean of verb top-1, noun top-1, and action top-1 accuracy).
 
+---
 
 ### 4.2 Continuing training (resume)
 
@@ -113,6 +123,8 @@ Workflow:
    sbatch train.slurm
 
 This process is repeated until training is stopped.  
+
+---
 
 ## 5. Validation and Codabench submission pipeline
 
@@ -150,6 +162,8 @@ This step is executed for three checkpoints corresponding to epochs 5, 8, and 10
   preds/preds_epoch8_fliptta.pt
   preds/preds_epoch10_fliptta.pt
 
+---
+
 ### 5.2 Ensemble checkpoints
 
 Script: ensemble_checkpoints.py
@@ -160,6 +174,8 @@ This script loads the three prediction files and performs equal-weight averaging
 
 Output:
   submission_ens_5_8_10.pt
+
+---
 
 ### 5.3 Apply logit bias calibration
 
@@ -178,12 +194,16 @@ Output:
 
 The same approach could be extended to other verb or noun classes, but only verb class 0 is biased in the final submission.
 
+---
+
 ### 5.4 Codabench submission
 
 The final file to upload to Codabench is:
   submission.pt
 
 Codabench results are used as the authoritative measure of generalization performance, as internal validation metrics tend to overestimate accuracy due to the random split used during training.
+
+---
 
 ## 6. Reproducibility notes
 
@@ -192,6 +212,7 @@ Codabench results are used as the authoritative measure of generalization perfor
 - No audio, optical flow, or object-centric features are used
 - No class-balanced sampling, gradient clipping, or mixed-precision training is applied
 
+---
 
 ## 7. End-to-end reproduction checklist
 
@@ -206,5 +227,6 @@ Codabench results are used as the authoritative measure of generalization perfor
    python bias.py
 7. Upload submission.pt to Codabench
 
+---
 
 
