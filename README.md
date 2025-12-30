@@ -41,12 +41,13 @@ RD_Project/
 │   ├── model.py                     # 2D ResNet-50 model (not used in this project's final submission)
 │   ├── make_submission_res3d_fliptta.py  # Validation inference with flip TTA
 │   ├── ensemble_checkpoints.py      # Logit-space ensembling of multiple checkpoints
-│   ├── bias.py                      # Logit bias calibration (α = 0.3 on verb class 0)
+│   ├── bias.py                      # Logit bias calibration 
 │   ├── check_val.py                 # final submission file check
 │   └── test_dataset.py              # Dataset checks and debugging
 │
 ├── .gitignore
 └── README.md
+```
 
 Code, data, and results are clearly separated to support reproducibility and ease of use.
 
